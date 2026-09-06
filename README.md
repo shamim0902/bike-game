@@ -155,6 +155,20 @@ If you want to build something like this yourself, the parts worth stealing:
    can drive the real page: teleport the bike, press keys, read the HUD. The dev build
    exposes `window.__drive` for exactly that.
 
+## Deploy
+
+It is a static site: `npm run build` writes `dist/`, and any static host serves it.
+For Vercel, `vercel.json` sets the framework, the build and the cache headers, so:
+
+1. Push the repo to GitHub.
+2. In Vercel, **Add New Project**, import the repo, keep the detected settings
+   (Vite, `npm run build`, `dist`), and deploy.
+3. Every push to `master` redeploys. Pull requests get preview URLs.
+
+Or from a terminal, `npx vercel` once to link the project and `npx vercel --prod` to ship.
+The whole site is about 3.6 MB, most of it the bike and the rider models, which the
+headers above let the browser keep for a day.
+
 ## Credits
 
 - Bike: 2017 Harley-Davidson FXDB Street Bob by "everhard" on Sketchfab, CC BY 4.0,
