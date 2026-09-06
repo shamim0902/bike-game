@@ -157,17 +157,23 @@ If you want to build something like this yourself, the parts worth stealing:
 
 ## Deploy
 
-It is a static site: `npm run build` writes `dist/`, and any static host serves it.
-For Vercel, `vercel.json` sets the framework, the build and the cache headers, so:
+It is a static site: `npm run build` writes `dist/`, and any static host serves it. It
+lives on Firebase Hosting, like the portfolio, under the wpminers account. `firebase.json`
+sets the public folder and the cache headers: a year for the hashed bundles, a day with
+background revalidation for the models and fonts. The whole site is about 3.6 MB, most of
+it the bike and the rider.
 
-1. Push the repo to GitHub.
-2. In Vercel, **Add New Project**, import the repo, keep the detected settings
-   (Vite, `npm run build`, `dist`), and deploy.
-3. Every push to `master` redeploys. Pull requests get preview URLs.
+From a terminal, signed in to the right account:
 
-Or from a terminal, `npx vercel` once to link the project and `npx vercel --prod` to ship.
-The whole site is about 3.6 MB, most of it the bike and the rider models, which the
-headers above let the browser keep for a day.
+```
+firebase use <project-id>   # once, writes .firebaserc
+npm run build
+firebase deploy --only hosting
+```
+
+`.github/workflows/firebase-hosting-merge.yml` does the same from GitHub Actions, run by
+hand from the Actions tab, to a preview channel by default and to `live` on request. It
+needs the service-account secret that `firebase init hosting:github` creates.
 
 ## Credits
 

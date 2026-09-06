@@ -2,3 +2,7 @@ node_modules
 dist
 .DS_Store
 *.log
+# firebase CLI writes these on deploy
+.firebase
+firebase-debug.log
+firebase-debug.*.log
