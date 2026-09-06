@@ -1,12 +1,17 @@
 <script setup>
 /**
- * Project Drive — browse the repos by driving to them.
+ * Nightlap: a night-time lap on a bike, with billboards to read on the way round.
  * A Harley-Davidson Street Bob (Sketchfab, CC-BY-4.0, by "everhard") on a Kenney CC0
- * tiled road; one billboard per repo along the sides; ¾ chase camera, and the avatar
- * rides pillion-less up front. W/↑ drives, S/↓ reverses, Enter (or a
- * click/tap on the billboard / HUD) opens the active repo. A thumb/mouse joystick
- * supports proportional driving and steering. Rendering pauses off-screen; the section falls back to the plain grid
- * without WebGL or with reduced motion (decided in GitHub.vue).
+ * tiled road; billboards along the sides, and places (small buildings, src/data/places.js)
+ * scattered beside the road by src/game/town.js, each with a parking bay and a door; ¾
+ * chase camera, and the avatar rides pillion-less up front. W/↑ drives, S/↓ reverses; pull
+ * into a place's P bay and press Enter to get off, walk to its door and go in
+ * (src/game/entrance.js). What is inside is an activity (src/game/activities).
+ * A thumb/mouse joystick supports proportional driving and steering. Rendering pauses
+ * off-screen; App.vue falls back to a message without WebGL or with reduced motion.
+ *
+ * This file began as the portfolio's ProjectDrive.vue (hasanuzzaman.com, v2.0.1), where the
+ * billboards were GitHub repos. It diverged on 2026-09-06 when the signs became the game's own.
  */
 import { onMounted, onBeforeUnmount, ref, shallowRef, computed, watch, nextTick } from 'vue'
 import * as THREE from 'three'
@@ -15,28 +20,40 @@ import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js'
 import { avatarInstance } from '@/composables/useAvatarModel'
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js'
 import { gsap, ScrollSmoother } from '@/composables/useGsap'
-import { createLapTimer, formatLapTime, readBestLap, saveBestLap } from '@/composables/useLapTimer'
 import { lockGameScroll, recoverGameScrollOnOutside } from '@/composables/useGameScrollLock'
 import { guide, reactTo } from '@/composables/useGuide'
-import { langColor, fmt } from '@/composables/ghFormat'
 import { buildCircuit } from '@/composables/useCircuit'
 import { createDriveInput } from '@/composables/useDriveInput'
+import { getStore } from '@/game/store'
+import { createEntrance, canEnter, doorPath, advanceAlong, headingTo } from '@/game/entrance'
+import { activityFor } from '@/game/activities'
+import { layoutPlaces } from '@/game/town'
+import { tuning } from '@/game/shop'
 import DriveJoystick from './DriveJoystick.vue'
 
-const props = defineProps({ repos: { type: Array, required: true } })
+const props = defineProps({ signs: { type: Array, required: true }, places: { type: Array, required: true } })
 const emit = defineEmits(['error', 'ready'])
 
 const host = ref(null)
 const gameRoot = ref(null), expanded = ref(false), gameSpace = ref(0)
-const lapView = shallowRef(null)
-let finishLine = null, lapUiAt = 0, fullscreenChanging = false
+const store = getStore()
+const entrance = createEntrance()
+const phase = ref('idle')                 // entrance.phase, mirrored for the template
+const placeTitle = ref('')                // the activity the rider is inside
+const activityView = shallowRef(null)     // what that activity wants the HUD to show
+const sceneComponent = shallowRef(null)   // a scene activity's own screen, over the stage
+let activity = null, doorWalk = null, doorMats = []
+// The bike as bought: multipliers on DRIVE and BOOST from the save's upgrade tiers.
+let tune = tuning(store.save.upgrades)
+watch(() => ({ ...store.save.upgrades }), (u) => { tune = tuning(u) })
+let finishLine = null, fullscreenChanging = false
 let focusBefore = null, releaseFullscreenScroll = null, fullscreenRestore = null
 let stopOutsideScrollRecovery = null, fullscreenOverflow = ''
 const gameInputActive = ref(true)
 const activeIdx = ref(-1)
 const driven = ref(false)          // first input hides the hint chips
 const failed = ref(false)
-const active = computed(() => props.repos[activeIdx.value] ?? null)
+const active = computed(() => props.places[activeIdx.value] ?? null)
 
 /**
  * The tarmac, drawn rather than modelled: dashes down the middle, solid lines at the
@@ -69,8 +86,8 @@ function roadTexture() {
 // --- world layout (metres) ---
 // A closed circuit rather than a straight road. The old one was 142m of tarmac with a
 // dead end at each end: eleven seconds at full throttle, then a three-point turn. A lap
-// has no ends, so the ride never stops and the repos are laid out around it — one lap is
-// the whole portfolio. Steering also finally means something; on a straight road inside
+// has no ends, so the ride never stops and the signs are laid out around it — one lap
+// passes every one. Steering also finally means something; on a straight road inside
 // two walls there was nothing to steer around.
 const track = buildCircuit({ radius: 42, wobble: 0.18 })
 // Wide enough to get a corner wrong on. 4.2 was a straight road's width carried onto a
@@ -81,15 +98,16 @@ const VERGE = 6.9                        // grass/boundary layout reference; slo
 const START_S = 6                        // where the bike sits at the start of the lap
 const finishPoint = track.at(START_S + 5)
 const FINISH_S = track.arc[finishPoint.i]
-// Repos spaced evenly around the lap, alternating sides so you're not always looking one
+// Signs spaced evenly around the lap, alternating sides so you're not always looking one
 // way. `s` is distance along the centreline; the world position comes off the curve.
-const STOP_GAP = track.length / Math.max(props.repos.length, 1)
-const stops = props.repos.map((r, i) => {
+// They are ads and nothing more: the places you can go into are laid out further down.
+const STOP_GAP = track.length / Math.max(props.signs.length, 1)
+const stops = props.signs.map((r, i) => {
   const side = i % 2 === 0 ? 1 : -1
   const s = START_S + 18 + i * STOP_GAP
-  const bay = track.at(s, side * 2.3)
+  const mid = track.at(s, 0)
   const sign = track.at(s, side * (ROAD_HALF + 3))
-  return { repo: r, s, side, bayX: side * 2.3, x: bay.x, z: bay.z, signX: sign.x, signZ: sign.z, tx: bay.tx, tz: bay.tz }
+  return { sign: r, s, side, signX: sign.x, signZ: sign.z, tx: mid.tx, tz: mid.tz }
 })
 const BAY_HALF_W = 1.2, BAY_HALF_L = 2.6 // capture box: across the road, and along it
 const ROAD_LEN = track.length
@@ -109,7 +127,7 @@ const rideMode = ref('riding') // riding | dismounting | walking | mounting
 const onFoot = computed(() => rideMode.value === 'walking')
 const switchingRide = computed(() => rideMode.value === 'mounting' || rideMode.value === 'dismounting')
 const canLeaveBike = ref(false), nearBike = ref(false)
-const interactionDisabled = computed(() => !riderReady.value || !mounted.value || switchingRide.value || (onFoot.value ? !nearBike.value : !canLeaveBike.value))
+const interactionDisabled = computed(() => !riderReady.value || !mounted.value || switchingRide.value || phase.value === 'toDoor' || (onFoot.value ? !nearBike.value : !canLeaveBike.value))
 const interactionLabel = computed(() => switchingRide.value ? (rideMode.value === 'mounting' ? 'Getting on…' : 'Getting off…')
   : onFoot.value ? (nearBike.value ? 'Ride bike' : 'Move closer to bike') : canLeaveBike.value ? 'Get off bike' : 'Stop on level ground')
 let changeRideTl = null
@@ -139,7 +157,7 @@ const DRIVE = { accel: 22, drag: 1.25, top: 18, brake: 26 }
 const BOOST = { after: 1.2, rise: 1.6, fall: 5, accel: 16, top: 13 }
 // Ramps, as stretches of the lap rather than objects in the world: `s` metres along it,
 // `len` long, rising to `h`. Placed midway between two signs, never near one — a jump
-// that lands you past the repo you were reading is a jump in the wrong place. Narrower
+// that lands you past the sign you were reading is a jump in the wrong place. Narrower
 // than the road on purpose, so the rider who doesn't want to jump can go round it.
 const RAMP_HALF = 2.1
 // Sited so the landing still falls short of the next sign at full boost — the whole ramp
@@ -147,30 +165,39 @@ const RAMP_HALF = 2.1
 const RAMPS = (stops.length >= 4 && STOP_GAP > 26 ? [1, Math.max(2, Math.round(stops.length * 0.6))] : [])
   .map((i) => ({ len: 9, h: 1.15, s: stops[i].s - STOP_GAP / 2 - 9 }))
 
-// Version the record by layout so a different set of ramps cannot inherit an easier best time.
-const bestLapKey = `portfolio:drive:lap:v1:${track.length.toFixed(2)}:${RAMPS.map(r => r.s.toFixed(2)).join(',')}`
-let savedBest = null
-try { savedBest = readBestLap(window.localStorage, bestLapKey) } catch { /* private/restricted storage */ }
-const lapTimer = createLapTimer({ length: track.length, start: FINISH_S, best: savedBest })
-lapView.value = lapTimer.snapshot(0)
+// The places: scattered along the lap from a seed, clear of the signs, the ramps and the
+// finish line, on a random side each. A bay on the road, a door on the verge in front of
+// the building, and the building itself further back.
+const spots = layoutPlaces({ length: track.length, count: props.places.length, gap: 15, seed: 7,
+  avoid: [...stops.map((st) => ({ s: st.s, r: 6 })), ...RAMPS.map((r) => ({ s: r.s + r.len / 2, r: r.len + 3 })), { s: FINISH_S, r: 8 }] })
+const places = spots.map((sp, i) => {
+  const { s, side } = sp
+  const bay = track.at(s, side * 2.3)
+  const door = track.at(s, side * (ROAD_HALF + 1.6))
+  const site = track.at(s, side * (ROAD_HALF + 4.6))
+  return { place: props.places[i], s, side, bayX: side * 2.3, x: bay.x, z: bay.z, doorX: door.x, doorZ: door.z, siteX: site.x, siteZ: site.z, tx: bay.tx, tz: bay.tz }
+})
 
-function cancelLap(reason) {
-  lapTimer.cancel(reason)
-  lapView.value = lapTimer.snapshot(performance.now())
-}
-
-function updateLapTiming(now) {
-  if (!mounted.value || rideMode.value !== 'riding' || (!inView.value && !expanded.value) || guide.tour.active || document.querySelector('.gallery')) {
-    if (lapView.value.running) cancelLap('Lap canceled · cross the line to retry.')
-    return
-  }
-  const result = lapTimer.update({ s: near.s, now, onRoad: !offRoad.value,
-    forward: state.v >= -0.05 && Math.sin(state.h) * near.tx - Math.cos(state.h) * near.tz > 0 })
-  if (result?.newBest) {
-    try { saveBestLap(window.localStorage, bestLapKey, result.time) } catch { /* keep this session's best */ }
-  }
-  // A tenth-second display avoids asking Vue to redraw the stats on every animation frame.
-  if (result || now - lapUiAt >= 100) { lapView.value = lapTimer.snapshot(now); lapUiAt = now }
+// --- the place the rider is inside, and what it needs from the town every frame ---
+// One object, mutated, so an activity that reads it sixty times a second allocates nothing.
+const activityCtx = { track, finishS: FINISH_S, store, setView: (v) => { activityView.value = v },
+  now: 0, s: 0, onRoad: true, forward: true, riding: false, onFoot: false, air: false, kmh: 0, x: 0, z: 0, side: 0, v: 0, boosting: false, placeS: 0,
+  markers: null, arrow: null, lights: null, // filled in below, once the job helpers exist
+  say: (text, duration = 3) => reactTo(text, null, { duration }),
+  attachToBike: (obj) => car?.add(obj),
+  // keeps its place in the world unless `remove`, in which case it is gone
+  detachFromBike: (obj, remove = false) => { if (!obj) return; if (remove) obj.parent?.remove(obj); else scene?.attach(obj) } }
+function updateActivity(now) {
+  if (!activity) return
+  activityCtx.now = now
+  activityCtx.riding = mounted.value && rideMode.value === 'riding' && inView.value && !guide.tour.active
+  activityCtx.s = near.s
+  activityCtx.x = state.x; activityCtx.z = state.z; activityCtx.side = near.side; activityCtx.v = state.v
+  activityCtx.boosting = state.boost > 0.45
+  activityCtx.onFoot = onFoot.value; activityCtx.air = !!state.air; activityCtx.kmh = Math.abs(state.v) * 3.6
+  activityCtx.onRoad = !offRoad.value
+  activityCtx.forward = state.v >= -0.05 && Math.sin(state.h) * near.tx - Math.cos(state.h) * near.tz > 0
+  activity.update(activityCtx)
 }
 
 function restoreGameLayout() {
@@ -269,19 +296,15 @@ function rampMesh(r) {
   return g
 }
 /**
- * Stars, from the repos' own star counts.
- *
- * The one thing on the circuit where the game and the data are the same thing: the
- * stars floating before a sign ARE that repo's stargazers, up to a dozen or so — a
- * project with forty has visibly more to collect than one with three. Riding through
- * them counts them.
+ * Stars: each sign says how many float on its run-in (`stars` in billboards.js), up to a
+ * dozen. Riding through them counts them.
  *
  * All of them live in one InstancedMesh: ninety-odd pickups for a single draw call and
  * one geometry, which is what keeps an arcade layer from costing anything to speak of.
  */
 const STAR = { cap: 12, y: 1.35, spread: 3.4, reach: 1.5 }
 const starCount = (n) => Math.max(2, Math.min(STAR.cap, n))
-const totalStars = props.repos.reduce((t, r) => t + starCount(r.stargazers_count), 0)
+const totalStars = props.signs.reduce((t, r) => t + starCount(r.stars), 0)
 const gotStars = ref(0)
 let starMesh = null, starAt = [], starGone = null
 const _m4 = new THREE.Matrix4(), _q4 = new THREE.Quaternion(), _s3 = new THREE.Vector3(1, 1, 1)
@@ -291,14 +314,14 @@ const _e3 = new THREE.Euler()
 // no extra geometry, no second render, an SVG that answers the question the section is
 // actually for: how many projects are there, and where am I among them.
 const mapPath = track.svgPath()
-const mapStops = stops.map((st) => { const [x, y] = mapPath.map(st.x, st.z); return { x, y } })
+const mapStops = places.map((st) => { const [x, y] = mapPath.map(st.x, st.z); return { x, y } })
 const mapBike = ref(null)
 // Readouts. `state` is a plain object on purpose — it's written every frame and making
 // it reactive would put Vue through the render pipeline sixty times a second. These two
 // are the only parts of it anyone reads, and they're only written when they change.
 const speed = ref(0)
 const boosting = ref(false)
-const visited = ref(stops.map(() => false))
+const visited = ref(places.map(() => false))
 const _mp = {}
 
 const orbit = { yaw: 0, pitch: 0, on: false }
@@ -307,28 +330,232 @@ function returnOrbit(delay = 2) {
   orbitHome?.kill()
   orbitHome = gsap.to(orbit, { yaw: 0, pitch: 0, duration: 1.1, delay, ease: 'power2.inOut', onComplete: () => (orbit.on = false) })
 }
-const raycaster = new THREE.Raycaster(), pointer = new THREE.Vector2()
 const _camDir = new THREE.Vector3(), _toStop = new THREE.Vector3(), _v3 = new THREE.Vector3()
-let billboardMeshes = []
-
-function billboardTexture(repo) {
+// A roadside billboard, painted at build time. The look is the real thing: a flat block
+// of colour, a picture on one side, a headline you can read at speed, a line under it
+// you read because you slowed down, and small print you only get by parking.
+const PAINT = {
+  red:    { bg: '#c8362b', ink: '#fff4e6', sub: '#ffd7c9', strip: '#8f2419', stripInk: '#ffd7c9' },
+  cream:  { bg: '#f3e9d2', ink: '#1c1a17', sub: '#4a4237', strip: '#1c1a17', stripInk: '#f3e9d2' },
+  blue:   { bg: '#2b63b8', ink: '#ffffff', sub: '#d6e6ff', strip: '#173f7d', stripInk: '#d6e6ff' },
+  yellow: { bg: '#ffd04b', ink: '#1c1a17', sub: '#4a3a0c', strip: '#1c1a17', stripInk: '#ffd04b' },
+  night:  { bg: '#131a24', ink: '#ffd04b', sub: '#cfd6e0', strip: '#ffd04b', stripInk: '#131a24' },
+  mint:   { bg: '#7fd8c0', ink: '#0f2f26', sub: '#1f4d40', strip: '#0f2f26', stripInk: '#bff0e2' },
+  purple: { bg: '#5b3a9e', ink: '#ffe9a8', sub: '#e3d6ff', strip: '#2f1c58', stripInk: '#e3d6ff' },
+}
+// Word-wrap onto at most `max` lines, shrinking the font until it fits; the last line
+// keeps whatever is left so a headline is never silently cut.
+function fitLines(x, text, width, max, font, size, min) {
+  for (let px = size; px >= min; px -= 2) {
+    x.font = font.replace('SIZE', px)
+    const lines = [], words = text.split(' ')
+    let line = ''
+    for (const w of words) {
+      const t = line ? `${line} ${w}` : w
+      if (x.measureText(t).width > width && line) { lines.push(line); line = w } else line = t
+    }
+    lines.push(line)
+    if (lines.length <= max && lines.every((l) => x.measureText(l).width <= width)) return { lines, px }
+    if (px - 2 < min) return { lines: lines.slice(0, max), px }
+  }
+}
+function billboardTexture(sign) {
+  const p = PAINT[sign.paint] || PAINT.cream
   const c = document.createElement('canvas'); c.width = 512; c.height = 320
   const x = c.getContext('2d')
-  x.fillStyle = '#131a24'; x.beginPath(); x.roundRect(0, 0, 512, 320, 26); x.fill()
-  x.strokeStyle = 'rgba(255,255,255,.16)'; x.lineWidth = 4; x.beginPath(); x.roundRect(2, 2, 508, 316, 24); x.stroke()
-  x.fillStyle = '#f6f1e7'; x.font = '600 40px Inter, sans-serif'
-  const name = repo.name.length > 22 ? repo.name.slice(0, 21) + '…' : repo.name
-  x.fillText(name, 34, 92)
-  x.fillStyle = '#ffd04b'; x.font = '500 34px Inter, sans-serif'
-  x.fillText(`★ ${fmt(repo.stargazers_count)}`, 34, 158)
-  if (repo.language) {
-    x.fillStyle = langColor[repo.language] || '#8a93a3'; x.beginPath(); x.arc(48, 216, 12, 0, 7); x.fill()
-    x.fillStyle = '#aeb6c2'; x.font = '30px Inter, sans-serif'; x.fillText(repo.language, 72, 227)
-  }
-  x.fillStyle = 'rgba(255,255,255,.45)'; x.font = '26px Inter, sans-serif'
-  x.fillText('drive close + Enter ↵', 34, 284)
+  // the board: a dark rim, then the paint
+  x.fillStyle = '#0d0f12'; x.beginPath(); x.roundRect(0, 0, 512, 320, 10); x.fill()
+  x.fillStyle = p.bg; x.beginPath(); x.roundRect(8, 8, 496, 304, 6); x.fill()
+  // a touch of print grain so it doesn't read as a UI card
+  x.fillStyle = 'rgba(0,0,0,.06)'
+  for (let i = 0; i < 90; i++) x.fillRect(8 + Math.random() * 496, 8 + Math.random() * 304, 2, 2)
+  // the picture, big, on the side away from the road edge. Colour emoji ignore fillStyle;
+  // a font without colour glyphs draws a silhouette in it, so make that the sign's ink.
+  x.fillStyle = p.ink
+  x.font = '128px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif'
+  x.textAlign = 'center'; x.textBaseline = 'middle'
+  x.fillText(sign.emoji, 412, 132)
+  // headline and the line under it share the space above the strip: wrap the headline as
+  // big as fits, then shrink it until both fit in the height
+  x.textAlign = 'left'; x.textBaseline = 'alphabetic'
+  const TOP = 36, BOTTOM = 250
+  let size = 60, head, line, height
+  do {
+    head = fitLines(x, sign.headline.toUpperCase(), 300, 3, '700 SIZEpx Inter, sans-serif', size, 30)
+    line = fitLines(x, sign.line, 300, 2, 'italic 500 SIZEpx Fraunces, Georgia, serif', 30, 22)
+    // from the top of the block to the italic line's descender, first-baseline offset included
+    height = head.px * 0.92 + head.lines.length * head.px * 1.02 + 8 + line.lines.length * line.px * 1.15
+    size = head.px - 2
+  } while (height > BOTTOM - TOP && size >= 30)
+  let y = TOP + head.px * 0.92 + Math.max(0, BOTTOM - TOP - height) / 2
+  x.fillStyle = p.ink; x.font = `700 ${head.px}px Inter, sans-serif`
+  head.lines.forEach((l) => { x.fillText(l, 30, y); y += head.px * 1.02 })
+  x.fillStyle = p.sub; x.font = `italic 500 ${line.px}px Fraunces, Georgia, serif`
+  y += 8
+  line.lines.forEach((l) => { x.fillText(l, 30, y); y += line.px * 1.15 })
+  // the strip along the bottom: who paid for it
+  x.fillStyle = p.strip; x.fillRect(8, 264, 496, 48)
+  x.fillStyle = p.stripInk; x.font = '500 19px Inter, sans-serif'; x.textBaseline = 'middle'
+  const small = fitLines(x, sign.small, 470, 1, '500 SIZEpx Inter, sans-serif', 19, 14)
+  x.font = `500 ${small.px}px Inter, sans-serif`
+  x.fillText(small.lines[0], 22, 289)
   const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 4
   return t
+}
+
+// A place's door: a dark frame, lit glass, the name over it, and what the place remembers
+// about you along the bottom. Repainted when a record changes.
+function doorTexture(place) {
+  const act = activityFor(place.id)
+  const leased = store.isLeased(place.id, place.lease || 0)
+  const open = !!act && leased
+  const best = open ? act.formatBest(store.save.best[place.id]) : null
+  const c = document.createElement('canvas'); c.width = 256; c.height = 384
+  const x = c.getContext('2d')
+  x.fillStyle = '#17120e'; x.fillRect(0, 0, 256, 384)                     // the frame
+  x.fillStyle = open ? '#3a2716' : '#241c15'; x.fillRect(18, 62, 220, 322) // the slab
+  const glow = x.createLinearGradient(0, 100, 0, 300)                      // the lit glass
+  glow.addColorStop(0, open ? '#fff1c9' : '#4a4034'); glow.addColorStop(1, open ? '#ffc76a' : '#2e2721')
+  x.fillStyle = glow; x.beginPath(); x.roundRect(48, 96, 160, 200, [80, 80, 6, 6]); x.fill()
+  x.fillStyle = '#17120e'; x.fillRect(126, 96, 4, 200); x.fillRect(48, 196, 160, 4) // glazing bars
+  x.fillStyle = '#ffd04b'; x.beginPath(); x.arc(212, 240, 6, 0, 7); x.fill()          // the handle
+  x.textAlign = 'center'; x.textBaseline = 'middle'
+  x.fillStyle = '#f6f1e7'; x.font = '600 21px Inter, sans-serif'
+  x.fillText(place.name.toUpperCase(), 128, 34, 228)                         // the name over the door
+  x.font = 'italic 500 19px Fraunces, Georgia, serif'
+  x.fillStyle = open ? '#ffd04b' : '#8a93a3'
+  x.fillText(!act ? 'Coming soon' : !leased ? `For lease · $${place.lease}` : (best ?? act.title), 128, 340, 210)
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 4
+  return t
+}
+function paintDoor(i) {
+  const mat = doorMats[i]
+  if (!mat) return
+  mat.map?.dispose()
+  mat.map = doorTexture(places[i].place)
+  mat.needsUpdate = true
+}
+
+// The buildings, from boxes: enough to tell a booth from a house from a shop from a gate
+// at riding speed, and nothing to download. Each faces +z, with its door on the front.
+function buildPlace(kind, doorMat) {
+  const g = new THREE.Group()
+  const wall = (w, h, d, color, x = 0, y = h / 2, z = 0) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshStandardMaterial({ color, roughness: 0.9 }))
+    m.position.set(x, y, z); g.add(m); return m
+  }
+  const lit = (w, h, x, y, z, color = '#ffe6a8') => {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color }))
+    m.position.set(x, y, z); g.add(m); return m
+  }
+  const door = (x, z, h = 2.2) => { const m = new THREE.Mesh(new THREE.PlaneGeometry(1.5, h), doorMat); m.position.set(x, h / 2, z); g.add(m) }
+  if (kind === 'booth') {
+    wall(2.6, 2.7, 2.4, '#26324a'); wall(3.0, 0.18, 2.8, '#151a24', 0, 2.79)
+    lit(1.0, 0.7, -0.65, 1.9, 1.21); door(0.55, 1.21)
+  } else if (kind === 'house') {
+    wall(4.2, 2.8, 3.6, '#5a4636')
+    const roof = new THREE.Mesh(new THREE.ConeGeometry(3.4, 1.5, 4), new THREE.MeshStandardMaterial({ color: '#3a2a22', roughness: 0.95 }))
+    roof.position.y = 3.55; roof.rotation.y = Math.PI / 4; g.add(roof)
+    lit(0.8, 0.8, -1.3, 1.6, 1.81); lit(0.8, 0.8, 1.3, 1.6, 1.81); door(0, 1.81)
+  } else if (kind === 'shop') {
+    wall(4.8, 3.0, 3.2, '#3b3f52'); lit(2.2, 1.4, -1.0, 1.5, 1.61, '#fff1c9')
+    const awning = wall(5.0, 0.12, 1.3, '#c8362b', 0, 2.4, 2.1); awning.rotation.x = 0.35
+    door(1.5, 1.61)
+  } else { // gate: two pillars, a lintel with a lamp, a stretch of fence either side
+    wall(0.7, 3.4, 0.7, '#4a4a55', -1.5); wall(0.7, 3.4, 0.7, '#4a4a55', 1.5)
+    wall(3.7, 0.4, 0.8, '#4a4a55', 0, 3.4); lit(0.5, 0.3, 0, 3.4, 0.41, '#ffd04b')
+    wall(2.6, 1.2, 0.15, '#3a3a44', -3.1, 0.6); wall(2.6, 1.2, 0.15, '#3a3a44', 3.1, 0.6)
+    door(0, 0.05, 2.6)
+  }
+  return g
+}
+
+// --- what a job puts in the town: markers on the road, an arrow that points at one, dots
+// on the minimap, and a hold on the lights. Activities reach these through activityCtx. ---
+let markerPool = [], arrowMesh = null, ringGeo = null
+const markerDots = shallowRef([])
+const arrow = { target: null }
+const lightsLocked = ref(false)
+function emojiTexture(emoji) {
+  const c = document.createElement('canvas'); c.width = 128; c.height = 128
+  const x = c.getContext('2d')
+  x.font = '92px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif'
+  x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillStyle = '#fff'
+  x.fillText(emoji, 64, 70)
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace
+  return t
+}
+function refreshDots() {
+  markerDots.value = markerPool.map((m) => { const [x, y] = mapPath.map(m.x, m.z); return { x, y, done: m.done, hidden: m.hidden } })
+}
+const markers = {
+  // list of { s, lat, emoji, color, hidden?, reveal? }: a ring on the ground and a picture above it
+  set(list) {
+    this.clear()
+    ringGeo ??= new THREE.TorusGeometry(1.5, 0.1, 8, 40)
+    list.forEach((m) => {
+      const p = track.at(m.s, m.lat)
+      const g = new THREE.Group()
+      const ring = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({ color: m.color, transparent: true, opacity: 0.85 }))
+      ring.rotation.x = -Math.PI / 2; ring.position.y = 0.04
+      const icon = new THREE.Sprite(new THREE.SpriteMaterial({ map: emojiTexture(m.emoji), transparent: true }))
+      icon.scale.set(1.3, 1.3, 1); icon.position.y = 1.5
+      g.add(ring, icon)
+      g.position.set(p.x, roadY + rampHeight(m.s, m.lat), p.z)
+      g.visible = !m.hidden
+      scene.add(g)
+      markerPool.push({ group: g, ring, icon, x: p.x, z: p.z, s: m.s, done: false, hidden: !!m.hidden, reveal: m.reveal || 0 })
+    })
+    refreshDots()
+  },
+  clear() {
+    markerPool.forEach((m) => { scene.remove(m.group); m.icon.material.map.dispose(); m.icon.material.dispose(); m.ring.material.dispose() })
+    markerPool = []
+    refreshDots()
+  },
+  show(i) { const m = markerPool[i]; if (m && m.hidden) { m.hidden = false; m.group.visible = true; refreshDots() } },
+  isDone(i) { return !!markerPool[i]?.done },
+  // from whoever is moving, bike or rider
+  dist(i) {
+    const m = markerPool[i]
+    if (!m || m.done || m.hidden) return Infinity
+    const a = onFoot.value ? foot : state
+    return Math.hypot(a.x - m.x, a.z - m.z)
+  },
+  done(i, success) {
+    const m = markerPool[i]
+    if (!m || m.done) return
+    m.done = true
+    gsap.to(m.group.scale, { x: 0.01, y: 0.01, z: 0.01, duration: 0.4, ease: 'back.in(2)', onComplete: () => { m.group.visible = false } })
+    if (success) ping(gotStars.value + 6)
+    refreshDots()
+  },
+}
+const lights = {
+  lock() { lightsLocked.value = true; if (lightsOn.value) toggleLights(true) },
+  unlock() { lightsLocked.value = false; if (!lightsOn.value) toggleLights(true) },
+}
+activityCtx.markers = markers; activityCtx.arrow = arrow; activityCtx.lights = lights
+// per frame: bob, spin, reveal by distance, and keep the arrow over the actor pointing at its target
+function updateMarkers(actor, t) {
+  for (const m of markerPool) {
+    if (m.done || m.hidden) continue
+    m.icon.position.y = 1.5 + Math.sin(t * 2.2 + m.s) * 0.12
+    m.ring.rotation.z = t * 0.8
+    if (m.reveal) {
+      const d = Math.hypot(actor.x - m.x, actor.z - m.z)
+      const o = THREE.MathUtils.clamp(1 - (d - 4) / (m.reveal - 4), 0, 1)
+      m.group.visible = o > 0.02
+      m.ring.material.opacity = o * 0.85; m.icon.material.opacity = o
+    }
+  }
+  if (!arrowMesh) return
+  const m = arrow.target !== null ? markerPool[arrow.target] : null
+  arrowMesh.visible = !!m && !m.done
+  if (arrowMesh.visible) {
+    arrowMesh.position.set(actor.x, roadY + (actor.y || 0) + 2.35 + Math.sin(t * 3) * 0.06, actor.z)
+    arrowMesh.lookAt(m.x, arrowMesh.position.y, m.z)
+  }
 }
 
 // painted parking spot: white outline open toward the road, amber "P"
@@ -627,10 +854,12 @@ async function init() {
   for (const r of RAMPS) { const m = new THREE.Mesh(rampMesh(r), rampMat); m.position.y = roadY + 0.001; road.add(m) }
   scene.add(road)
 
-  // billboards
+  // billboards. The sign text is painted with the page's web fonts, which may still be
+  // in flight this early; wait for them or the first paint falls back to system fonts.
+  try { await Promise.all([document.fonts.load('700 60px Inter'), document.fonts.load('italic 500 30px Fraunces')]) } catch { /* draw with fallbacks */ }
   stops.forEach((s, i) => {
     const g = new THREE.Group()
-    const panel = new THREE.Mesh(new THREE.PlaneGeometry(4.6, 2.85), new THREE.MeshBasicMaterial({ map: billboardTexture(s.repo) }))
+    const panel = new THREE.Mesh(new THREE.PlaneGeometry(4.6, 2.85), new THREE.MeshBasicMaterial({ map: billboardTexture(s.sign) }))
     panel.position.y = 3.3
     const glow = new THREE.Mesh(new THREE.PlaneGeometry(5.0, 3.25), new THREE.MeshBasicMaterial({ color: '#ffd04b', transparent: true, opacity: 0 }))
     glow.position.set(0, 3.3, -0.02)
@@ -646,8 +875,6 @@ async function init() {
     back.position.y = 3.3; back.rotation.y = Math.PI
     const backGlow = new THREE.Mesh(glow.geometry, glow.material)
     backGlow.position.set(0, 3.3, 0.02); backGlow.rotation.y = Math.PI
-    back.userData.idx = i
-    billboardMeshes.push(back)
     g.add(glow, panel, backGlow, back, post)
     g.position.set(s.signX, roadY, s.signZ)
     // Facing back up the road at whoever is riding toward it, turned 0.22 in toward the
@@ -655,12 +882,18 @@ async function init() {
     // built from the tangent rather than assumed. Getting the sign of this wrong points
     // every sign the other way, and a single-sided plane seen from behind is invisible.
     g.rotation.y = Math.atan2(-s.tx, -s.tz) - s.side * 0.22
-    panel.userData.idx = i
-    billboardMeshes.push(panel)
     frames[i] = glow
     stopGroups[i] = g
     scene.add(g)
   })
+
+  // the job arrow: a cone over the bike, tip along +z so lookAt aims it
+  arrowMesh = new THREE.Group()
+  const cone = new THREE.Mesh(new THREE.ConeGeometry(0.28, 0.75, 16),
+    new THREE.MeshStandardMaterial({ color: '#ffd04b', emissive: '#ffb01f', emissiveIntensity: 1.2, roughness: 0.4 }))
+  cone.rotation.x = Math.PI / 2
+  arrowMesh.add(cone); arrowMesh.visible = false
+  scene.add(arrowMesh)
 
   // the stars, laid out along the run-in to each sign
   if (totalStars) {
@@ -673,12 +906,12 @@ async function init() {
     let k = 0
     const p = {}
     stops.forEach((st) => {
-      const n = starCount(st.repo.stargazers_count)
+      const n = starCount(st.sign.stars)
       for (let j = 0; j < n; j++) {
         // strung along the road toward the sign, weaving across it so collecting them
         // is a line you ride rather than a spot you park on
         const d = st.s - STAR.spread * (n - j) - 2
-        const lat = Math.sin(j * 1.9) * 1.7 + st.bayX * 0.25
+        const lat = Math.sin(j * 1.9) * 1.7 + st.side * 0.6
         track.at(d, lat, p)
         starAt.push(p.x, STAR.y, p.z)
         k++
@@ -687,10 +920,23 @@ async function init() {
     scene.add(starMesh)
   }
 
-  // parking bays — pull into a P spot to select its project
+  // the places: a building set back from the road, its door on the verge, a P bay on the
+  // road in front. Door faces are unlit so they glow at night; repainted when a record changes.
+  doorMats = places.map(() => new THREE.MeshBasicMaterial())
+  places.forEach((s, i) => {
+    const g = buildPlace(s.place.building, doorMats[i])
+    g.position.set(s.siteX, roadY, s.siteZ)
+    g.rotation.y = Math.atan2(s.x - s.siteX, s.z - s.siteZ) // the front looks at the bay
+    scene.add(g)
+    paintDoor(i)
+  })
+  watch(() => places.map((s) => store.save.best[s.place.id]), (now, before) => {
+    now.forEach((v, i) => { if (v !== before[i]) paintDoor(i) })
+  })
+  watch(() => store.save.leased.length, () => places.forEach((_, i) => paintDoor(i)))
   const bayGeo = new THREE.PlaneGeometry(2.3, 4.4)
   const bayTex = { 1: bayTexture(false), '-1': bayTexture(true) }
-  stops.forEach((s, i) => {
+  places.forEach((s, i) => {
     const bay = new THREE.Mesh(bayGeo, new THREE.MeshBasicMaterial({ map: bayTex[s.side], transparent: true, opacity: 0.8, depthWrite: false }))
     bay.rotation.x = -Math.PI / 2
     bay.position.set(s.x, roadY + 0.02, s.z)
@@ -728,7 +974,7 @@ async function init() {
   timer = new THREE.Timer()
   tick()
   loadRider().catch(() => (mounted.value = true)) // the avatar riding along — optional, never blocks the scene
-  if (import.meta.env.DEV) window.__drive = { state, stops, activeIdx, lightsOn, camMode, honk, engine: () => engine, muted,
+  if (import.meta.env.DEV) window.__drive = { state, stops, places, activeIdx, lightsOn, camMode, honk, engine: () => engine, muted, store, entrance, enterPlace, leavePlace, foot, track, mounted, riderReady, rideMode, phase, activityView, inView, doorMats: () => doorMats, doorTexture, activityCtx, markers: () => markerPool, tune: () => tune, sceneOpen: () => !!sceneComponent.value,
     probe: () => { // bike-local positions of the rider's hands, for pose tuning
       const out = {}
       for (const n of ['RightHand', 'LeftHand']) {
@@ -859,10 +1105,15 @@ function toggleRideMode() {
       .to(rider.position, { y: SADDLE[1] + 0.2, duration: 0.32 }, approach)
       .to(rider.position, { y: SADDLE[1], duration: 0.33 }, approach + 0.32)
       .to(riderPose, { sit: 1, duration: 0.65 }, approach)
-  } else {
-    if (Math.abs(state.v) > 0.8 || state.air || state.y > 0.05) return
+  } else dismount()
+}
+
+// Getting off. `onDone` runs once he is standing beside the bike. Returns false if the
+// bike is not stopped on level ground.
+function dismount(onDone) {
+    if (Math.abs(state.v) > 0.8 || state.air || state.y > 0.05) return false
     rideMode.value = 'dismounting'
-    cancelLap('Lap canceled · explore on foot, or cross the line to retry.')
+    activity?.interrupt(activityCtx, 'Lap canceled · explore on foot, or cross the line to retry.')
     ensureRunClip()
     state.v = state.boost = state.held = state.steer = state.squash = 0
     car.rotation.set(0, Math.PI - state.h, 0)
@@ -874,12 +1125,85 @@ function toggleRideMode() {
       scene.attach(rider)
       foot.x = rider.position.x; foot.z = rider.position.z; foot.h = state.h; foot.v = 0
       rideMode.value = 'walking'; changeRideTl = null
+      onDone?.()
     } })
       .to(rider.position, { y: SADDLE[1] + 0.25, duration: 0.3 }, 0)
       .to(riderPose, { sit: 0, duration: 0.65 }, 0)
       .to(rider.position, { x: -1.25, z: MOUNT.beside[2], duration: 0.7 }, 0.1)
       .to(rider.position, { y: -0.02, duration: 0.4 }, 0.4)
+    return true
+}
+
+// --- going into a place: park in the bay, Enter, off the bike, walk to the door ---
+const activeActivity = computed(() => (active.value ? activityFor(active.value.id) : null))
+const activeLeased = computed(() => !!active.value && store.isLeased(active.value.id, active.value.lease || 0))
+const doorLine = computed(() => {
+  if (!active.value) return ''
+  const act = activeActivity.value
+  if (!act) return 'Coming soon'
+  if (!activeLeased.value) return `For lease · $${active.value.lease}`
+  return `${act.title} · ${act.formatBest(store.save.best[active.value.id]) ?? 'No record yet'}`
+})
+const enterLine = computed(() => !canGoIn.value ? '' : activeLeased.value ? 'Enter to go in ↵'
+  : store.canAfford(active.value.lease) ? `Enter to lease ↵` : 'Not enough cash')
+// The button's state. canLeaveBike is the same stopped-on-level-ground test, kept reactive.
+const canGoIn = computed(() => phase.value === 'idle' && rideMode.value === 'riding' && !!activeActivity.value
+  && riderReady.value && mounted.value && canLeaveBike.value)
+function setPhase(next) { if (next) phase.value = next; return next }
+
+function enterPlace() {
+  if (guide.tour.active) return
+  const idx = activeIdx.value
+  const ok = canEnter({ phase: entrance.phase, rideMode: rideMode.value, stop: idx, speed: state.v, air: state.air, height: state.y,
+    riderReady: riderReady.value, mounted: mounted.value, hasActivity: !!activityFor(props.places[idx]?.id) })
+  if (!ok) return false
+  const place = props.places[idx]
+  if (!store.isLeased(place.id, place.lease || 0)) {
+    if (!store.lease(place.id, place.lease)) { reactTo(`${place.name} wants $${place.lease}. You have $${store.save.cash}.`, null, { duration: 3 }); return true }
+    reactTo(`${place.name} is yours.`, null, { duration: 3 })
   }
+  clearInput(); driven.value = true
+  orbitHome?.kill(); orbit.on = false; orbit.yaw = orbit.pitch = 0
+  setPhase(entrance.send('enter', idx))
+  const started = dismount(() => {
+    if (entrance.phase !== 'dismounting') return // cancelled mid-animation: he just gets off
+    setPhase(entrance.send('dismounted'))
+    const st = places[entrance.stop]
+    doorWalk = doorPath({ bike: { x: state.x, z: state.z }, forward: { x: Math.sin(state.h), z: -Math.cos(state.h) },
+      door: { x: st.doorX, z: st.doorZ } })
+  })
+  if (!started) cancelEntrance()
+  return started
+}
+// The automatic walk. Any input cancels it (see onKey and moveJoystick) and leaves him standing.
+function walkToDoor(dt) {
+  if (!doorWalk) return
+  if (advanceAlong(foot, doorWalk, FOOT.walk, dt)) {
+    doorWalk = null
+    const st = places[entrance.stop]
+    foot.h = headingTo({ x: foot.x, z: foot.z }, { x: st.siteX, z: st.siteZ })
+    activity = activityFor(st.place.id)
+    placeTitle.value = activity.title
+    activityCtx.placeS = st.s
+    setPhase(entrance.send('arrived'))
+    if (activity.kind === 'scene') { clearInput(); sceneComponent.value = activity.component }
+    activity.enter(activityCtx)
+    reactTo(`${st.place.name}. ${activity.title}.`, null, { every: 3000, duration: 2.5 })
+  }
+  placeFoot(dt)
+}
+function cancelEntrance() {
+  doorWalk = null
+  setPhase(entrance.send('cancel'))
+}
+function leavePlace() {
+  if (entrance.phase !== 'inside') return
+  activity?.exit(activityCtx)
+  activity = null
+  placeTitle.value = ''
+  activityView.value = null
+  sceneComponent.value = null
+  setPhase(entrance.send('leave'))
 }
 
 function walkOnFoot(dt) {
@@ -898,6 +1222,12 @@ function walkOnFoot(dt) {
   if ((across / 0.65) ** 2 + (forward / 1.55) ** 2 < 1) {
     foot.x = previousX; foot.z = previousZ; foot.v = foot.held = 0
   }
+  placeFoot(dt)
+}
+
+// Where `foot` says he is, made true: clamped to the town, lifted by the ramps, and the
+// clips blended for how fast he is going.
+function placeFoot(dt) {
   track.nearest(foot.x, foot.z, footNear)
   const limit = VERGE + 9
   if (footNear.dist > limit) {
@@ -1009,20 +1339,20 @@ function updateBike(dt) {
   // something you commit to. It bleeds away far faster than it builds: lifting off, or
   // running onto the grass, drops you straight back out of it.
   state.held = input.fwd >= 0.85 && !offRoad.value ? state.held + dt : 0
-  const want = state.held > BOOST.after ? 1 : 0
+  const want = state.held > tune.boostAfter ? 1 : 0
   state.boost = THREE.MathUtils.damp(state.boost, want, want ? BOOST.rise : BOOST.fall, dt)
 
   // S brakes when you're going forwards and reverses when you've stopped — one key, but
   // hauling a bike down from a hundred is not the same thing as backing it up.
   const braking = input.back && state.v > 0.5
-  const accel = input.fwd ? input.fwd * (DRIVE.accel + BOOST.accel * state.boost) : braking ? -DRIVE.brake * input.back : -11 * input.back
+  const accel = input.fwd ? input.fwd * (DRIVE.accel * tune.accel + BOOST.accel * tune.boostAccel * state.boost) : braking ? -DRIVE.brake * input.back : -11 * input.back
   state.v += accel * dt
   // Rolling friction, and it — not the clamp below — is what actually sets the top speed:
   // a bike settles where the throttle and the drag cancel, at accel/friction. That pair
   // used to work out at 41 km/h however high the ceiling was set, which is why the ceiling
   // looked broken. The clamp is now only a backstop above where the bike naturally sits.
   state.v *= Math.exp(-(offRoad.value ? 3.6 : DRIVE.drag) * dt)
-  const top = DRIVE.top + BOOST.top * state.boost
+  const top = DRIVE.top * tune.top + BOOST.top * tune.boostTop * state.boost
   // The grass caps you rather than braking you — and gently enough that clipping a verge
   // costs you the boost, not the whole lap.
   state.v = THREE.MathUtils.clamp(state.v, -8, offRoad.value ? 14 : top)
@@ -1104,9 +1434,9 @@ function tick() {
   if (rideMode.value === 'riding') updateBike(dt)
   else {
     brakeLight.material.opacity = 0
-    if (onFoot.value) walkOnFoot(dt)
+    if (onFoot.value) { if (entrance.phase === 'toDoor') walkToDoor(dt); else walkOnFoot(dt) }
   }
-  updateLapTiming(performance.now())
+  updateActivity(performance.now())
   const actor = onFoot.value ? foot : state
   const actorNear = onFoot.value ? footNear : near
   const fx = Math.sin(actor.h), fz = -Math.cos(actor.h)
@@ -1171,26 +1501,21 @@ function tick() {
     g.visible = _toStop.dot(_camDir) > (camMode.value === 0 ? 2.8 : 1.5)
   })
 
-  // active project = the parking bay the car is inside
+  // active place = the parking bay the car is inside
   let best = -1
-  for (let i = 0; i < stops.length; i++) {
-    const s = stops[i]
+  for (let i = 0; i < places.length; i++) {
+    const s = places[i]
     // measured on the track rather than in the world: how far across the road you are,
     // and how far round the lap — which is the same test it always was, in the one
     // coordinate system that still means something now the road bends
     if (!actor.air && Math.abs(actorNear.side - s.bayX) < BAY_HALF_W && along(actorNear.s, s.s) < BAY_HALF_L) { best = i; break }
   }
   if (best !== activeIdx.value) {
-    if (activeIdx.value >= 0) {
-      gsap.to(frames[activeIdx.value].material, { opacity: 0, duration: 0.3 })
-      gsap.to(bayGlows[activeIdx.value].material, { opacity: 0, duration: 0.3 })
-    }
+    if (activeIdx.value >= 0) gsap.to(bayGlows[activeIdx.value].material, { opacity: 0, duration: 0.3 })
     if (best >= 0) {
       if (!visited.value[best]) { const v = visited.value.slice(); v[best] = true; visited.value = v }
-      gsap.to(frames[best].material, { opacity: 0.55, duration: 0.3 })
       gsap.to(bayGlows[best].material, { opacity: 0.35, duration: 0.3 })
-      gsap.fromTo(stopGroups[best].scale, { x: 0.92, y: 0.92, z: 0.92 }, { x: 1, y: 1, z: 1, duration: 0.5, ease: 'back.out(2.2)', overwrite: true })
-      reactTo(`${stops[best].repo.name} — ${fmt(stops[best].repo.stargazers_count)} stars. Enter opens it.`, null, { every: 3000, duration: 2.5 })
+      reactTo(`${places[best].place.name}. ${places[best].place.blurb}`, null, { every: 3000, duration: 2.5 })
     }
     activeIdx.value = best
   }
@@ -1205,6 +1530,7 @@ function tick() {
       if ((actor.x - x) ** 2 + (actor.z - z) ** 2 < STAR.reach ** 2) {
         starGone[i] = 1
         gotStars.value++
+        store.earn({ stars: 1 })
         _m4.makeScale(0, 0, 0).setPosition(x, y, z)
         starMesh.setMatrixAt(i, _m4)
         ping(gotStars.value)
@@ -1233,10 +1559,9 @@ function tick() {
     parkedMap.value.setAttribute('transform', `translate(${mx.toFixed(2)} ${my.toFixed(2)})`)
   }
 
+  if (markerPool.length || arrowMesh?.visible) updateMarkers(actor, timer.getElapsed())
   renderer.render(scene, camera)
 }
-
-function openActive() { if (active.value) window.open(active.value.html_url, '_blank', 'noopener') }
 
 // Real recordings (public/drive/audio): the bike start-up plays once on the first
 // throttle, then a seamless engine loop is pitch-shifted by speed; the horn is a
@@ -1324,15 +1649,18 @@ function honk() {
     if (audioCtx.state === 'suspended') audioCtx.resume()
     loadSound('horn').then((buf) => {
       if (!buf || muted.value) return
-      const s = audioCtx.createBufferSource(); s.buffer = buf
-      const g = audioCtx.createGain(); g.gain.value = 0.85
-      s.connect(g); g.connect(audioCtx.destination); s.start()
+      const g = audioCtx.createGain(); g.gain.value = tune.hornGain; g.connect(audioCtx.destination)
+      for (let i = 0; i < tune.honks; i++) {
+        const s = audioCtx.createBufferSource(); s.buffer = buf; s.playbackRate.value = tune.hornRate
+        s.connect(g); s.start(audioCtx.currentTime + i * buf.duration * 0.7)
+      }
     })
   } catch { /* no audio available */ }
   if (car) gsap.fromTo(car.scale, { y: 0.94 }, { y: 1, duration: 0.35, ease: 'elastic.out(1.4, 0.4)', overwrite: true })
   driven.value = true
 }
-function toggleLights() {
+function toggleLights(force = false) {
+  if (lightsLocked.value && force !== true) return // a job has them (blackout)
   lightsOn.value = !lightsOn.value
   headlights.forEach((l) => (l.visible = lightsOn.value))
   lamps.forEach((m) => m.material.color.set(lightsOn.value ? '#fff3cf' : '#5a5548'))
@@ -1343,6 +1671,8 @@ const inView = ref(false)
 const movementKeys = { w: 'fwd', ArrowUp: 'fwd', s: 'back', ArrowDown: 'back', a: 'left', ArrowLeft: 'left', d: 'right', ArrowRight: 'right' }
 function onKey(e, down) {
   const k = e.key.length === 1 ? e.key.toLowerCase() : e.key
+  if (down && k === 'Escape' && entrance.phase === 'inside') { e.preventDefault(); leavePlace(); return }
+  if (sceneComponent.value) return // a scene has the screen; only Escape reaches the town
   if (down && k === 'Escape' && expanded.value && !document.fullscreenElement) { e.preventDefault(); toggleFullscreen(); return }
   const direction = movementKeys[k]
   if (!down) {
@@ -1354,28 +1684,36 @@ function onKey(e, down) {
   if (direction) {
     e.preventDefault()
     if (switchingRide.value) return
+    if (entrance.phase === 'toDoor') cancelEntrance()
     skipMount(); controls.button(`key:${k}`, direction, true); driven.value = true
     if (!onFoot.value) ensureEngine()
   }
-  else if (k === 'e' && !e.repeat) { e.preventDefault(); toggleRideMode() }
+  else if (k === 'e' && !e.repeat) { e.preventDefault(); if (entrance.phase === 'toDoor') cancelEntrance(); else toggleRideMode() }
+  // Enter is the one key for the bike and the places: go in when parked at one, otherwise get off or back on.
+  else if (k === 'Enter' && !e.repeat && !e.target.closest?.('button, a')) {
+    e.preventDefault()
+    if (entrance.phase === 'toDoor') cancelEntrance()
+    else if (!enterPlace()) toggleRideMode()
+  }
   else if (k === 'h' && !e.repeat && !onFoot.value) honk()
   else if ((k === 'l' || k === 'L') && down && !e.repeat) toggleLights()
   else if ((k === 'm' || k === 'M') && down && !e.repeat) toggleMute()
   else if ((k === 'c' || k === 'C') && down && !e.repeat) cycleCam()
-  else if (k === 'Enter' && active.value && !e.target.closest?.('button, a')) openActive()
 }
 const keydown = (e) => onKey(e, true)
 const keyup = (e) => onKey(e, false)
 function moveJoystick(value) {
   if (!value.x && !value.y) { controls.joystick(value); return }
-  if (switchingRide.value || guide.tour.active || !inView.value) return
+  if (switchingRide.value || guide.tour.active || !inView.value || sceneComponent.value) return
+  if (entrance.phase === 'toDoor') cancelEntrance()
   gameInputActive.value = true
   skipMount(); controls.joystick(value); driven.value = true
   if (!onFoot.value) ensureEngine()
 }
 function releaseControls() {
   clearInput(); updateEngine()
-  if (!fullscreenChanging) cancelLap('Lap canceled · cross the line to retry.')
+  if (entrance.phase === 'toDoor') cancelEntrance()
+  if (!fullscreenChanging) activity?.interrupt(activityCtx)
 }
 function onVisibility() { if (document.hidden) releaseControls() }
 watch(() => guide.tour.active, on => { if (on) releaseControls() })
@@ -1407,11 +1745,6 @@ function onWinUp() {
 function onCanvasClick(e) {
   if (!renderer) return
   if (suppressClick) { suppressClick = false; return } // that was an orbit drag, not a click
-  const r = renderer.domElement.getBoundingClientRect()
-  pointer.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1)
-  raycaster.setFromCamera(pointer, camera)
-  const hit = raycaster.intersectObjects(billboardMeshes)[0]
-  if (hit) window.open(props.repos[hit.object.userData.idx].html_url, '_blank', 'noopener')
 }
 
 function resize() {
@@ -1487,14 +1820,17 @@ onBeforeUnmount(() => {
   <div v-if="!failed" ref="gameRoot" class="drive" :class="{ 'is-expanded': expanded }" :data-mode="rideMode" @pointerdown="gameInputActive = true" @focusin="gameInputActive = true">
     <div ref="host" class="drive__stage" :data-cursor="onFoot ? 'walk' : 'drive'" @click="onCanvasClick">
       <div v-show="mounted" class="drive__hint" :class="{ 'is-dim': driven }">
-        <span class="drive__hint-keys"><span><b>W/S</b> {{ onFoot ? 'walk' : 'drive' }}</span><span><b>A/D</b> {{ onFoot ? 'turn' : 'steer' }}</span><span><b>E</b> {{ onFoot ? 'ride nearby bike' : 'get off' }}</span><span><b>C</b> camera</span><span>hold <b>W/↑</b> to {{ onFoot ? 'run' : 'boost' }}</span><span><b>drag</b> look</span><span><b>↵</b> open</span></span>
+        <span class="drive__hint-keys"><span><b>W/S</b> {{ onFoot ? 'walk' : 'drive' }}</span><span><b>A/D</b> {{ onFoot ? 'turn' : 'steer' }}</span><span><b>↵</b> {{ onFoot ? 'ride nearby bike' : 'get off, or go in at a P spot' }}</span><span><b>C</b> camera</span><span>hold <b>W/↑</b> to {{ onFoot ? 'run' : 'boost' }}</span><span><b>drag</b> look</span></span>
         <span class="drive__hint-touch"><span><b>Joystick</b> {{ onFoot ? 'walk & turn' : 'drive & steer' }}</span><span>pull back to {{ onFoot ? 'step back' : 'brake' }}</span><span>hold fully up to {{ onFoot ? 'run' : 'boost' }}</span><span><b>🎥</b> view</span></span>
       </div>
-      <!-- the lap, the projects on it, and where the bike is -->
+      <!-- the lap, the places on it, and where the bike is -->
       <svg v-show="mounted" class="drive__map" viewBox="0 0 100 100" aria-hidden="true">
         <path :d="mapPath.d" class="drive__map-road" />
         <circle v-for="(m, i) in mapStops" :key="i" :cx="m.x" :cy="m.y" r="2.6"
                 class="drive__map-stop" :class="{ 'is-seen': visited[i], 'is-on': i === activeIdx }" />
+        <template v-for="(m, i) in markerDots" :key="'job' + i">
+          <circle v-if="!m.hidden" :cx="m.x" :cy="m.y" r="2.2" class="drive__map-job" :class="{ 'is-done': m.done }" />
+        </template>
         <g ref="mapBike" class="drive__map-bike"><path d="M0 -4 L3 3.4 L0 1.6 L-3 3.4 Z" /></g>
         <g v-show="onFoot" ref="parkedMap" class="drive__map-parked"><circle r="3.5" /><title>Parked bike</title></g>
       </svg>
@@ -1502,51 +1838,44 @@ onBeforeUnmount(() => {
       <div v-show="mounted" class="drive__read">
         <span class="drive__read-speed" :class="{ 'is-boost': boosting, 'is-off': !onFoot && offRoad }"><b>{{ speed }}</b>{{ onFoot ? 'on foot' : offRoad ? 'off road' : 'km/h' }}</span>
         <span v-if="totalStars" class="drive__read-stars">★ {{ gotStars }}<i>/{{ totalStars }}</i></span>
+        <span class="drive__read-cash">$<b>{{ store.save.cash }}</b></span>
       </div>
       <div class="drive__rush" :class="{ 'is-on': boosting }" aria-hidden="true" />
 
-      <div class="drive__ctl" @click.stop>
+      <div v-if="guide.say.text" :key="guide.say.key" class="drive__say" role="status">{{ guide.say.text }}</div>
+      <div v-if="sceneComponent" class="drive__scene" @click.stop>
+        <component :is="sceneComponent" :store="store" @leave="leavePlace" />
+      </div>
+      <div v-show="!sceneComponent" class="drive__ctl" @click.stop>
         <div class="drive__aux">
-          <button aria-label="Toggle lights" class="drive__emoji" :class="{ 'is-on': lightsOn }" @pointerdown.prevent="toggleLights">💡</button>
+          <button aria-label="Toggle lights" class="drive__emoji" :class="{ 'is-on': lightsOn }" :disabled="lightsLocked" @pointerdown.prevent="toggleLights()">💡</button>
           <button aria-label="Honk" class="drive__emoji" :disabled="rideMode !== 'riding'" @pointerdown.prevent="honk">📯</button>
           <button aria-label="Camera view" class="drive__emoji" @pointerdown.prevent="cycleCam">🎥</button>
         </div>
         <DriveJoystick class="drive__joystick" :disabled="switchingRide || guide.tour.active || !inView" :reset-key="controlsReset" :on-foot="onFoot" @move="moveJoystick" />
       </div>
     </div>
-    <div v-if="mounted" class="drive__race">
+    <div v-if="phase === 'inside' && activityView" class="drive__race">
       <div class="drive__lap-stats">
-        <span>Laps <b>{{ lapView.laps }}</b></span>
-        <span>Time <b role="timer" aria-live="off">{{ formatLapTime(lapView.elapsed) }}</b></span>
-        <span>Best <b>{{ formatLapTime(lapView.best) }}</b></span>
-        <span v-if="lapView.last !== null">Last <b>{{ formatLapTime(lapView.last) }}</b></span>
+        <span v-for="st in activityView.stats" :key="st.label">{{ st.label }} <b :role="st.live ? 'timer' : undefined" aria-live="off">{{ st.value }}</b></span>
       </div>
       <div class="drive__race-actions">
-        <span v-if="expanded" class="drive__fullscreen-hint">Press <kbd>ESC</kbd> to exit fullscreen</span>
-        <button class="drive__fullscreen" :aria-pressed="expanded" :aria-label="expanded ? 'Exit fullscreen' : 'Expand game'" :title="expanded ? 'Exit fullscreen (Esc)' : 'Expand game'" @click="toggleFullscreen">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path v-if="expanded" d="M3 9h6V3m6 0v6h6M3 15h6v6m6 0v-6h6" />
-            <path v-else d="M9 3H3v6m12-6h6v6M3 15v6h6m12-6v6h-6" />
-          </svg>
-        </button>
+        <button class="drive__leave" @click="leavePlace"><kbd>Esc</kbd> Leave</button>
       </div>
-      <p class="drive__lap-status" role="status">{{ onFoot ? 'On foot · timed laps are bike-only.' : lapView.message }}<span v-if="lapView.running"> · Checks {{ lapView.checkpoints }}/{{ lapView.totalCheckpoints }}</span></p>
+      <p class="drive__lap-status" role="status">{{ activityView.status }}</p>
     </div>
     <div v-if="riderReady && mounted" class="drive__mode-bar">
-      <span role="status">{{ onFoot ? 'On foot · hold forward to run. Gold map marker = your bike.' : switchingRide ? 'Switching…' : 'Riding · stop to explore on foot.' }}</span>
-      <button :disabled="interactionDisabled" :aria-label="interactionLabel" @click="toggleRideMode"><kbd>E</kbd> {{ interactionLabel }}</button>
+      <span role="status">{{ phase === 'toDoor' ? 'Walking to the door. Any key stops.' : phase === 'inside' ? `Inside: ${placeTitle}. Esc to leave.` : onFoot ? 'On foot · hold forward to run. Gold map marker = your bike.' : switchingRide ? 'Switching…' : 'Riding · park in a P spot to go in.' }}</span>
+      <button :disabled="interactionDisabled" :aria-label="interactionLabel" @click="toggleRideMode"><kbd>↵</kbd> {{ interactionLabel }}</button>
     </div>
     <Transition name="fade" mode="out-in">
-      <button v-if="active" :key="active.id" class="drive__hud" @click="openActive">
-        <span class="drive__hud-name">{{ active.name }}</span>
-        <span class="drive__hud-desc">{{ active.description || 'No description yet.' }}</span>
-        <span class="drive__hud-meta">
-          <i v-if="active.language" :style="{ background: langColor[active.language] || '#8a93a3' }" /> {{ active.language }}
-          · ★ {{ fmt(active.stargazers_count) }} <template v-if="active.forks_count">· ⑂ {{ fmt(active.forks_count) }}</template>
-          <em>open ↵</em>
-        </span>
-      </button>
-      <p v-else class="drive__hud drive__hud--idle">{{ stops.length }} projects around this lap — {{ onFoot ? 'walk' : 'pull' }} into a <b>P</b> spot to select one.</p>
+      <component :is="canGoIn ? 'button' : 'div'" v-if="active" :key="active.id" class="drive__hud" :class="{ 'is-open': canGoIn }" @click="canGoIn && enterPlace()">
+        <span class="drive__hud-name">{{ active.emoji }} {{ active.name }}</span>
+        <span class="drive__hud-desc">{{ active.blurb }}</span>
+        <span class="drive__hud-meta">{{ doorLine }}<em v-if="enterLine">{{ enterLine }}</em></span>
+      </component>
+      <p v-else-if="phase === 'inside'" class="drive__hud drive__hud--idle">Inside <b>{{ placeTitle }}</b>. Press <b>Esc</b> or Leave to walk out.</p>
+      <p v-else class="drive__hud drive__hud--idle">{{ places.length }} places around this lap. Pull into a <b>P</b> spot and press <b>Enter</b> to go in.</p>
     </Transition>
   </div>
   </Teleport>
@@ -1572,14 +1901,14 @@ onBeforeUnmount(() => {
   &__lap-stats b { color: $paper; font-variant-numeric: tabular-nums; margin-left: .25rem; }
   &__lap-status { flex-basis: 100%; margin: 0; font-size: .72rem; color: $muted; }
   &__race-actions { display: flex; align-items: center; gap: .6rem; margin-left: auto; }
-  &__fullscreen-hint { font-size: .68rem; color: $muted; kbd { padding: .1rem .3rem; border: 1px solid rgba(255,255,255,.18); border-radius: 4px; font: inherit; color: $paper; } }
-  &__fullscreen {
-    display: grid; place-items: center; flex-shrink: 0; width: 34px; height: 34px; padding: 0;
+  &__leave {
+    flex-shrink: 0; min-height: 34px; padding: .35rem .7rem; font-size: .75rem;
     border: 1px solid rgba(255,208,75,.25); border-radius: 9px; background: rgba(255,208,75,.07); color: $accent; cursor: pointer;
     transition: background .2s, border-color .2s;
     &:hover { background: rgba(255,208,75,.16); border-color: $accent; }
     &:focus-visible { outline: 2px solid $accent; outline-offset: 3px; }
-    @media (pointer: coarse) { width: 44px; height: 44px; }
+    kbd { margin-right: .35rem; padding: .1rem .3rem; border: 1px solid currentColor; border-radius: 3px; font: inherit; }
+    @media (pointer: coarse) { min-height: 44px; kbd { display: none; } }
   }
   &__mode-bar {
     display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .7rem;
@@ -1606,6 +1935,7 @@ onBeforeUnmount(() => {
       &.is-seen { fill: rgba(255, 208, 75, .75); }        // one you've already pulled into
       &.is-on { fill: $accent; r: 3.6; }
     }
+    &-job { fill: $accent-2; stroke: $ink; stroke-width: .8; &.is-done { fill: rgba(255,255,255,.25); } }
     &-bike path { fill: #fff; stroke: rgba(0, 0, 0, .55); stroke-width: .8; }
     &-parked circle { fill: $accent; stroke: $ink; stroke-width: 1; }
   }
@@ -1627,8 +1957,21 @@ onBeforeUnmount(() => {
       &.is-off { color: #ff9b6a; border-color: rgba(255, 155, 106, .45); }
     }
     &-stars { color: rgba(255, 208, 75, .85) !important; }
+    &-cash { color: rgba(18, 212, 219, .9) !important; b { color: inherit; margin-left: .1em; } }
   }
   // the edges close in when the top gear engages — the whole of the boost's visual cost
+  &__say {
+    position: absolute; left: 50%; bottom: 3.4rem; transform: translateX(-50%); z-index: 3; max-width: min(70%, 520px);
+    padding: .5rem .9rem; border-radius: 12px; background: rgba(8, 10, 16, .78); border: 1px solid rgba(255,208,75,.35);
+    color: $paper; font-family: $font-display; font-style: italic; font-size: .95rem; text-align: center; pointer-events: none;
+    animation: say-in .25s $ease-out;
+    @media (max-width: 600px) { bottom: 5.2rem; font-size: .85rem; max-width: 86%; }
+  }
+  @keyframes say-in { from { opacity: 0; transform: translate(-50%, 6px); } }
+  &__scene {
+    position: absolute; inset: 0; z-index: 6; display: grid; place-items: center; padding: 1rem;
+    background: rgba(6, 9, 14, .5); overflow: auto;
+  }
   &__rush {
     position: absolute; inset: 0; z-index: 1; pointer-events: none; opacity: 0;
     transition: opacity .45s ease;
@@ -1676,12 +2019,11 @@ onBeforeUnmount(() => {
   &__hud {
     display: grid; gap: .3rem; width: 100%; text-align: left; margin-top: .9rem; padding: 1rem 1.2rem;
     background: #111721; border: 1px solid rgba(255,255,255,.09); border-radius: 14px; color: $paper;
-    transition: border-color .25s; cursor: pointer;
-    &:hover { border-color: rgba(255, 208, 75, .5); }
+    transition: border-color .25s;
+    &.is-open { cursor: pointer; border-color: rgba(255, 208, 75, .35); &:hover { border-color: $accent; } }
     &-name { font-weight: 600; font-size: 1.05rem; }
-    &-desc { color: $muted; font-size: .85rem; }
-    &-meta { display: flex; align-items: center; gap: .45rem; font-size: .75rem; color: #cfd6e0;
-      i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    &-desc { font-family: $font-display; font-style: italic; color: $paper; font-size: .95rem; }
+    &-meta { display: flex; align-items: center; gap: .45rem; font-size: .75rem; color: $muted;
       em { margin-left: auto; font-style: normal; color: $accent; letter-spacing: .12em; text-transform: uppercase; font-size: .68rem; } }
     &--idle { display: block; color: $muted; font-size: .85rem; cursor: default; text-align: center; b { color: $accent; } }
   }
