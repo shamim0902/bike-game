@@ -1,0 +1,25 @@
+@use 'fonts';
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; overscroll-behavior-y: none; }
+body {
+  margin: 0;
+  background: $ink;
+  color: $paper;
+  font-family: $font-body;
+  font-weight: 300;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+img, svg { display: block; max-width: 100%; }
+a { color: inherit; }
+h1, h2, h3 { font-family: $font-display; font-weight: 500; line-height: 1; margin: 0; }
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+
+:focus:not(:focus-visible) { outline: none; }
+:focus-visible { outline: 2px solid $accent; outline-offset: 3px; }
+
+.eyebrow { font-size: 0.75rem; letter-spacing: 0.22em; text-transform: uppercase; color: $muted; }
+.container { width: min(1200px, 92vw); margin-inline: auto; }
